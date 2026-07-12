@@ -1,0 +1,17 @@
+[Unit]
+Description=Inkbird IBT-4XS -> Telegram bridge
+After=bluetooth.target network-online.target
+Wants=bluetooth.target network-online.target
+
+[Service]
+Type=simple
+# Change these three to match your setup:
+User=youruser
+WorkingDirectory=/home/youruser/ibbq
+EnvironmentFile=/home/youruser/ibbq/ibbq.env
+ExecStart=/home/youruser/ibbq/venv/bin/python /home/youruser/ibbq/ibbq_telegram.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
