@@ -403,12 +403,18 @@ class App:
         asyncio.create_task(self.check_alerts(temps))
 
     def on_settings(self, _sender, data: bytearray):
-        # Battery reply: header 0x24, then current/max voltage (uint16 LE each)
+        # Battery reply: header 0x24, then current/max voltage (uint16 LE each).
+        # Fires for both a user /battery request and the device's own periodic
+        # report; either way, send the battery message then a status update.
         if data and data[0] == 0x24 and len(data) >= 5:
             cur = data[1] | (data[2] << 8)
             mx = (data[3] | (data[4] << 8)) or 6550
             pct = max(0, min(100, round(cur / mx * 100)))
-            asyncio.create_task(self.tg.send(f"Battery ~{pct}% ({cur}/{mx} mV)"))
+            asyncio.create_task(self._battery_report(cur, mx, pct))
+
+    async def _battery_report(self, cur: int, mx: int, pct: int):
+        await self.tg.send(f"Battery ~{pct}% ({cur}/{mx} mV)")
+        await self.tg.send(self.status_text())
 
     async def check_alerts(self, temps: dict[int, Optional[float]]):
         for idx, temp in temps.items():
