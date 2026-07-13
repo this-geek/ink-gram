@@ -17,9 +17,12 @@ Reference: https://gist.github.com/uucidl/b9c60b6d36d8080d085a8e3310621d64
 
 import asyncio
 import json
+import io
 import logging
 import os
 import signal
+import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -45,6 +48,10 @@ SCAN_TIMEOUT      = 15    # seconds per scan attempt
 TEMP_DIVISOR  = 10.0
 UNPLUGGED_RAW = 0xFFF0    # raw >= this means "no probe in this slot"
 HYSTERESIS_C  = 2.0       # re-arm an alert only after temp moves back this far
+
+# In-memory history for /graph (this cook only; cleared on each connection)
+HISTORY_SAMPLE_SECONDS = 5      # store at most one sample this often
+HISTORY_MAX            = 20000  # backstop cap (~28h at 5s) to bound memory
 
 # iBBQ GATT UUIDs (16-bit shorthand expanded to full 128-bit)
 UUID_CREDENTIALS = "0000fff2-0000-1000-8000-00805f9b34fb"
@@ -147,6 +154,18 @@ class Telegram:
         except Exception as e:
             log.warning("telegram send failed: %s", e)
 
+    async def send_photo(self, png: bytes, caption: str = ""):
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(self.chat))
+        if caption:
+            form.add_field("caption", caption)
+        form.add_field("photo", png, filename="graph.png",
+                       content_type="image/png")
+        try:
+            await self.s.post(f"{self.base}/sendPhoto", data=form)
+        except Exception as e:
+            log.warning("telegram photo failed: %s", e)
+
     async def poll(self, handler):
         """Long-poll getUpdates and dispatch text messages to `handler`."""
         while True:
@@ -175,6 +194,7 @@ class Telegram:
 HELP = (
     "IBT-4XS bot commands:\n"
     "/status - current probe temps + configured alerts\n"
+    "/graph - a chart of this cook so far\n"
     "/probeN target=160c low=45c high=102c - set alerts for probe N (1-4)\n"
     "    target: ping once when the probe reaches this temp\n"
     "    low/high: ping when the probe leaves this band\n"
@@ -194,6 +214,77 @@ class App:
         self.state = State()
         self.tg = Telegram(session, BOT_TOKEN, CHAT_ID)
         self.client: Optional[BleakClient] = None
+        # (timestamp, {probe_idx: temp_c}) for the current session
+        self.history: deque = deque(maxlen=HISTORY_MAX)
+        self._last_sample = 0.0
+
+    # ---- graphing ----
+    def _render_png(self) -> Optional[bytes]:
+        """Render the session history to a PNG. Runs in a worker thread."""
+        import matplotlib
+        matplotlib.use("Agg")           # headless backend, no display needed
+        import matplotlib.pyplot as plt
+
+        hist = list(self.history)
+        if not hist:
+            return None
+        t0 = hist[0][0]
+        probe_ids = sorted({i for _, temps in hist
+                            for i, v in temps.items() if v is not None})
+        if not probe_ids:
+            return None
+
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        for pid in probe_ids:
+            xs, ys = [], []
+            for ts, temps in hist:
+                v = temps.get(pid)
+                if v is not None:
+                    xs.append((ts - t0) / 60.0)
+                    ys.append(v)
+            if xs:
+                ax.plot(xs, ys, linewidth=1.8, label=f"Probe {pid + 1}")
+
+        ax.set_xlabel("Minutes")
+        ax.set_ylabel("Temperature (C)")
+        ax.set_title("Current session")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+
+        # right-hand axis in Fahrenheit, mapped from the same range
+        ax2 = ax.twinx()
+        lo, hi = ax.get_ylim()
+        ax2.set_ylim(c_to_f(lo), c_to_f(hi))
+        ax2.set_ylabel("Temperature (F)")
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=110)
+        plt.close(fig)
+        return buf.getvalue()
+
+    async def send_graph(self):
+        if not self.history:
+            await self.tg.send("No data yet this session "
+                               "(is the thermometer connected?).")
+            return
+        try:
+            png = await asyncio.to_thread(self._render_png)
+        except ImportError:
+            await self.tg.send("Graphing needs matplotlib. Install it with:\n"
+                               "  ./venv/bin/pip install matplotlib")
+            return
+        except Exception as e:
+            log.warning("graph render failed: %s", e)
+            await self.tg.send("Couldn't render the graph.")
+            return
+        if not png:
+            await self.tg.send("No probe data to plot yet.")
+            return
+        span = (self.history[-1][0] - self.history[0][0]) / 60.0
+        await self.tg.send_photo(
+            png, caption=f"Session so far: {span:.0f} min, "
+                         f"{len(self.history)} samples")
 
     # ---- Telegram command handling ----
     async def handle_command(self, text: str):
@@ -204,6 +295,8 @@ class App:
             await self.tg.send(HELP)
         elif cmd == "status":
             await self.tg.send(self.status_text())
+        elif cmd == "graph":
+            await self.send_graph()
         elif cmd in ("mute", "silence"):
             ok = await self.write_settings(MSG_SILENCE_ALARM)
             await self.tg.send("Silenced the device alarm." if ok
@@ -303,6 +396,10 @@ class App:
             raw = data[2 * i] | (data[2 * i + 1] << 8)
             temps[i] = None if raw >= UNPLUGGED_RAW else raw / TEMP_DIVISOR
         self.state.latest = temps
+        now = time.time()
+        if now - self._last_sample >= HISTORY_SAMPLE_SECONDS:
+            self._last_sample = now
+            self.history.append((now, dict(temps)))
         asyncio.create_task(self.check_alerts(temps))
 
     def on_settings(self, _sender, data: bytearray):
@@ -372,7 +469,9 @@ class App:
                     await client.write_gatt_char(
                         UUID_SETTINGS, MSG_REALTIME_ENABLE, response=True)
 
-                    # fresh cook -> re-arm every alert
+                    # fresh cook -> clear history + re-arm every alert
+                    self.history.clear()
+                    self._last_sample = 0.0
                     for cfg in self.state.probes.values():
                         cfg.target_armed = cfg.low_armed = cfg.high_armed = True
 
